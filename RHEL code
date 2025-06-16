@@ -1,0 +1,203 @@
+#include <quickfix/Application.h>
+#include <quickfix/Session.h>
+#include <quickfix/SessionSettings.h>
+#include <quickfix/SocketInitiator.h>
+#include <quickfix/FileStore.h>
+#include <quickfix/FileLog.h>
+#include <quickfix/fix44/NewOrderSingle.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <string.h>
+
+#include <zmq.hpp>
+
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <atomic>
+
+// ---------- Constants ----------
+#define MULTICAST_ADDR "239.192.1.1"
+#define PORT 30001
+#define BATCH_RECV_SIZE 32
+#define PROCESS_BATCH_SIZE 100
+#define MAX_MSG_SIZE 2048
+
+// ---------- Dummy Market Data ----------
+struct MarketDataMessage {
+    char data[MAX_MSG_SIZE];
+    size_t length;
+};
+
+// ---------- Market Data Processor ----------
+void process(const std::vector<MarketDataMessage>& batch) {
+    std::cout << "[MarketData] Processing batch of size: " << batch.size() << std::endl;
+}
+
+// ---------- UDP Multicast Receiver ----------
+void run_udp_receiver(std::atomic<bool>& running) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket failed");
+        return;
+    }
+
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = inet_addr(MULTICAST_ADDR);
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+        perror("setsockopt failed");
+        return;
+    }
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        return;
+    }
+
+    struct mmsghdr msgs[BATCH_RECV_SIZE];
+    struct iovec iovecs[BATCH_RECV_SIZE];
+    char bufs[BATCH_RECV_SIZE][MAX_MSG_SIZE];
+
+    memset(msgs, 0, sizeof(msgs));
+    for (int i = 0; i < BATCH_RECV_SIZE; ++i) {
+        iovecs[i].iov_base = bufs[i];
+        iovecs[i].iov_len = MAX_MSG_SIZE;
+        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    std::vector<MarketDataMessage> batch;
+    batch.reserve(PROCESS_BATCH_SIZE);
+
+    while (running.load()) {
+        int n = recvmmsg(sockfd, msgs, BATCH_RECV_SIZE, 0, NULL);
+        if (n < 0) {
+            perror("recvmmsg failed");
+            break;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            MarketDataMessage msg;
+            msg.length = msgs[i].msg_len;
+            memcpy(msg.data, bufs[i], msg.length);
+            batch.push_back(msg);
+
+            if (batch.size() >= PROCESS_BATCH_SIZE) {
+                process(batch);
+                batch.clear();
+            }
+        }
+    }
+
+    close(sockfd);
+}
+
+// ---------- ZeroMQ Publisher ----------
+void run_publisher(std::atomic<bool>& running) {
+    zmq::context_t context(1);
+    zmq::socket_t publisher(context, zmq::socket_type::pub);
+    publisher.bind("tcp://127.0.0.1:5555");
+
+    while (running.load()) {
+        zmq::message_t message("MARKET_UPDATE", 13);
+        publisher.send(message, zmq::send_flags::none);
+        usleep(1000); // 1ms
+    }
+}
+
+// ---------- ZeroMQ Subscriber ----------
+void run_subscriber(std::atomic<bool>& running) {
+    zmq::context_t context(1);
+    zmq::socket_t subscriber(context, zmq::socket_type::sub);
+    subscriber.connect("tcp://127.0.0.1:5555");
+    subscriber.setsockopt(ZMQ_SUBSCRIBE, "", 0);
+
+    zmq::pollitem_t items[] = { { static_cast<void*>(subscriber), 0, ZMQ_POLLIN, 0 } };
+
+    while (running.load()) {
+        zmq::poll(items, 1, 100);
+        if (items[0].revents & ZMQ_POLLIN) {
+            zmq::message_t msg;
+            subscriber.recv(msg, zmq::recv_flags::none);
+            std::string data(static_cast<char*>(msg.data()), msg.size());
+            std::cout << "[ZMQ Subscriber] Received: " << data << std::endl;
+        }
+    }
+}
+
+// ---------- FIX Application ----------
+class MyApplication : public FIX::Application {
+public:
+    void onCreate(const FIX::SessionID&) override {}
+    void onLogon(const FIX::SessionID& sessionID) override {
+        std::cout << "[FIX] Logon! Sending batch..." << std::endl;
+        sendBatchOrders(sessionID);
+    }
+    void onLogout(const FIX::SessionID&) override {}
+    void toAdmin(FIX::Message&, const FIX::SessionID&) override {}
+    void fromAdmin(const FIX::Message&, const FIX::SessionID&) override {}
+    void toApp(FIX::Message&, const FIX::SessionID&) override {}
+    void fromApp(const FIX::Message& message, const FIX::SessionID&) override {
+        std::cout << "[FIX] Received message: " << message.toString() << std::endl;
+    }
+
+private:
+    void sendBatchOrders(const FIX::SessionID& sessionID) {
+        for (int i = 0; i < 5; ++i) {
+            FIX44::NewOrderSingle newOrder(
+                FIX::ClOrdID("ORDER" + std::to_string(i)),
+                FIX::HandlInst('1'),
+                FIX::Symbol("AAPL"),
+                FIX::Side(FIX::Side_BUY),
+                FIX::TransactTime(),
+                FIX::OrdType(FIX::OrdType_MARKET)
+            );
+            newOrder.set(FIX::OrderQty(100));
+            FIX::Session::sendToTarget(newOrder, sessionID);
+        }
+    }
+};
+
+// ---------- Main ----------
+int main() {
+    std::atomic<bool> running(true);
+
+    std::thread udp_thread(run_udp_receiver, std::ref(running));
+    std::thread zmq_pub_thread(run_publisher, std::ref(running));
+    std::thread zmq_sub_thread(run_subscriber, std::ref(running));
+
+    try {
+        FIX::SessionSettings settings("config.cfg");
+        MyApplication app;
+        FIX::FileStoreFactory storeFactory(settings);
+        FIX::FileLogFactory logFactory(settings);
+        FIX::SocketInitiator initiator(app, storeFactory, settings, logFactory);
+
+        initiator.start();
+        std::cout << "[Main] FIX client started. Press Ctrl+C to exit.\n";
+
+        // Run indefinitely
+        std::this_thread::sleep_for(std::chrono::minutes(10)); // simulate long run
+        running = false;
+
+        initiator.stop();
+    } catch (std::exception& e) {
+        std::cerr << "[Main] Exception: " << e.what() << std::endl;
+        running = false;
+    }
+
+    udp_thread.join();
+    zmq_pub_thread.join();
+    zmq_sub_thread.join();
+
+    return 0;
+}
